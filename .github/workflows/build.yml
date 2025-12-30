@@ -45,20 +45,20 @@ jobs:
             echo "Build complete."
             echo ""
 
-      - name: Find generated XZ file
+      - name: Find generated ZIP file
         id: findfile
         run: |
-          FILE=$(find . -maxdepth 3 -type f -name "*.xz" | head -n 1)
+          FILE=$(find . -maxdepth 3 -type f -name "*.zip" | head -n 1)
           echo "file=$FILE" >> $GITHUB_OUTPUT
 
-      - name: Verify XZ file exists
+      - name: Verify ZIP file exists
         run: |
           if [ -z "${{ steps.findfile.outputs.file }}" ]; then
-            echo "No .xz file found!"
+            echo "No .zip file found!"
             exit 1
           fi
 
-      - name: Upload XZ artifact
+      - name: Upload ZIP artifact
         uses: actions/upload-artifact@v5
         with:
           name: arm64-build-${{ github.ref_name }}
