@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+trap 'ret=$?; echo "${RED}Error in ${0} at line ${LINENO}${NOCOLOUR}"; exit $ret' ERR
+IFS=$'\n\t'
+
+# STANDARD COLOURS
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[0;37m'
+BLACK='\033[0;30m'
+
+# BRIGHT COLOURS
+BRIGHT_RED='\033[1;31m'
+BRIGHT_GREEN='\033[1;32m'
+BRIGHT_YELLOW='\033[1;33m'
+BRIGHT_BLUE='\033[1;34m'
+BRIGHT_MAGENTA='\033[1;35m'
+BRIGHT_CYAN='\033[1;36m'
+BRIGHT_WHITE='\033[1;37m'
+
+# OTHER FUN COLOURS
+ORANGE='\033[38;5;214m'   # 256-colour orange
+PURPLE='\033[38;5;93m'    # 256-colour purple
+PINK='\033[38;5;205m'     # 256-colour pink
+LIGHT_GRAY='\033[38;5;250m'
+DARK_GRAY='\033[38;5;238m'
+
+# RESET
+NOCOLOUR='\033[0m'
+
+# HELPERS
+info() {
+  echo -e "${BRIGHT_CYAN} [💡] INFO${NOCOLOUR} $*${BRIGHT_CYAN} [💡]"
+}
+
+warn() {
+  echo -e "${BRIGHT_YELLOW} [❗] WARN${NOCOLOUR} $*${BRIGHT_YELLOW} [❗]"
+}
+
+error() {
+  echo -e "${BRIGHT_RED} [☢️ ] ERROR${NOCOLOUR} $*${BRIGHT_RED} [☢️ ]"
+}
+
+success() {
+  echo -e "${BRIGHT_GREEN} [✅] SUCCESS${NOCOLOUR} $*${BRIGHT_GREEN} [✅]"
+}
+
+SCRIPTNAME=$(basename "$0")
+MOUNT="mnt"
+RPIZIP="raspios-bullseye-arm64.zip"
+RPIIMG="${RPIZIP%.zip}.img"
+RPIURL="https://downloads.raspberrypi.org/raspios_lite_arm64/images/raspios_lite_arm64-2022-01-28/2022-01-28-raspios-bullseye-arm64-lite.zip"
+
+# Allow empty sets
+shopt -s nullglob
+
+ensureRoot() {
+  if [[ $EUID -ne 0 ]]; then
+    error "$SCRIPTNAME: This script must be run as root." 1>&2
+    exit 1
+  fi
+}
+
+checkDeps() {
+  local DEPS=(wget unzip parted e2fsprogs xz-utils patch coreutils pv qemu-user-static)
+
+  apt update -qq
+  info "INSTALLING DEPENDENCIES"
+  apt install -y --fix-missing "${DEPS[@]}"
+  success
+}
+
+msg() {
+  warn "$SCRIPTNAME: These scripts will build a system image for a Raspberry Pi Zero W..."
+}
+
+unzipimg() {
+  if [ -f "$RPIZIP" ]; then
+    unzip -o "$RPIZIP"
+  else
+    wget -O "$RPIZIP" "$RPIURL" && unzip -o "$RPIZIP"
+  fi
+
+  IMGFILE="$(unzip -Z1 "$RPIZIP" | grep '\.img$' | head -n 1)"
+  #[ -f "$IMGFILE" ] && mv -f "$IMGFILE" "$RPIIMG"
+}
+
+unmount() {
+  if [[ ! -f "${MOUNT}/.gitignore" ]]; then
+    df -h "${MOUNT}/boot" "${MOUNT}"
+    umount "${MOUNT}/dev/pts" || true
+    umount "${MOUNT}/dev" || true
+    umount "${MOUNT}/tmp" || true
+    umount "${MOUNT}/sys" || true
+    umount "${MOUNT}/proc" || true
+    umount "${MOUNT}/boot" || true
+    umount "${MOUNT}" || true
+  fi
+}
+
+detach() {
+  [ -n "${LOOPDEV:-}" ] && losetup --detach "$LOOPDEV" || true
+}
+
+cleanup() {
+  info "$SCRIPTNAME: Running cleanup..."
+  unmount
+  detach
+  success
+}
+
+trap cleanup EXIT
+
+attachImg() {
+  info "Attaching image"
+  LOOPDEV=$(losetup --find --show --partscan "$RPIIMG")
+  parted --script "$LOOPDEV" print
+  BOOTDEV=$(ls "${LOOPDEV}"*1)
+  ROOTDEV=$(ls "${LOOPDEV}"*2)
+  success
+}
+
+expandImg() {
+  info "Expanding image"
+  truncate -s 4G "$RPIIMG"
+  losetup -c "$LOOPDEV"
+  parted --script "$LOOPDEV" resizepart 2 100%
+  e2fsck -f "$ROOTDEV"
+  resize2fs "$ROOTDEV"
+  success
+}
+
+mntImg() {
+  info "Mounting image"
+  [ ! -d "$MOUNT" ] && mkdir "$MOUNT"
+  mount "$ROOTDEV" "$MOUNT"
+  [ ! -d "$MOUNT/boot" ] && mkdir "$MOUNT/boot"
+  mount "$BOOTDEV" "$MOUNT/boot"
+  success
+}
+
+prepChroot() {
+  info "Preparing chroot"
+  mount -t proc none "$MOUNT/proc"
+  mount -t sysfs none "$MOUNT/sys"
+  mount -o bind /tmp "$MOUNT/tmp"
+  mount -o bind /dev "$MOUNT/dev"
+  mount -t devpts none "$MOUNT/dev/pts"
+  success
+}
+
+cpDistroFiles() {
+  info "Copying files"
+  for dir in boot etc home; do
+    cp -rf "$dir" "$MOUNT/"
+  done
+  success
+}
+
+applyPatches() {
+  info "Applying patches"
+  for patch in patches.d/*; do
+    patch -p0 -d "$MOUNT" < "$patch"
+  done
+  success
+}
+
+confSwap() {
+  info "Housekeeping (PART 1)"
+  mv -f "$MOUNT/etc/resolv.conf" "$MOUNT/etc/resolv.conf.bak"
+  cp -f /etc/resolv.conf "$MOUNT/etc/resolv.conf"
+  # mv -f "$MOUNT/etc/ld.so.preload" "$MOUNT/etc/ld.so.preload.bak"
+  cp -f /usr/bin/qemu-arm-static "$MOUNT/usr/bin/"
+  success
+}
+
+runScripts() {
+  info "Running setup scripts"
+  for script in scripts.d/*; do
+    install -Dm755 "$script" "$MOUNT/tmp/$(basename "$script")"
+    chroot "$MOUNT" "/tmp/$(basename "$script")"
+    rm -f "$MOUNT/tmp/$(basename "$script")"
+  done
+  success
+}
+
+insWebmin() {
+  info "SETTING UP WEBMIN APT REPO"
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/webmin/webmin/master/webmin-setup-repo.sh)" -- -f --stable
+
+  info "RUNNING APT UPDATE"
+  apt update -qq
+
+  info "INSTALLING WEBMIN & USERMIN"
+  apt install -y --install-recommends --fix-broken webmin usermin
+  success
+}
+
+insCode() {
+  info "INSTALLING CODE SERVER"
+  curl -fsSL https://code-server.dev/install.sh | sh
+  systemctl enable --now code-server@"$USER"
+  success
+}
+
+reSwapConf() {
+  info "Housekeeping (PART 2)"
+  mv -f "$MOUNT/etc/resolv.conf.bak" "$MOUNT/etc/resolv.conf"
+  # mv -f "$MOUNT/etc/ld.so.preload.bak" "$MOUNT/etc/ld.so.preload"
+  rm -f "$MOUNT/usr/bin/qemu-arm-static"
+  success
+}
+
+chkShrnk() {
+  info "Shrinking image"
+  e2fsck -y -f "$ROOTDEV" || true
+  resize2fs -M "$ROOTDEV"
+  BLKSIZE=$(dumpe2fs -h "$ROOTDEV" 2>/dev/null | grep "Block size")
+  BLKCOUNT=$(dumpe2fs -h "$ROOTDEV" 2>/dev/null | grep "Block count")
+  info "BLOCK SIZE: $BLKSIZE"
+  info "BLOCK COUNT: $BLKCOUNT"
+  success
+}
+
+xzFinalImg() {
+  info "Compressing final image: $RPIIMG"
+  if command -v pv >/dev/null 2>&1; then
+    pv "$RPIIMG" | xz -T0 -zke -9 -c > "${RPIIMG}.xz"
+    success
+  else
+    warn "pv not found, compressing without progress bar..."
+    xz -T0 -zke -9 "$RPIIMG"
+    success
+  fi
+  success "Image compressed to ${RPIIMG}.xz"
+  rm -f "$RPIIMG"
+}
+
+##########################################################################
+#                                                                        #
+#       ==================== EXECUTION ORDER ====================        #
+#                                                                        #
+##########################################################################
+
+ensureRoot
+checkDeps
+msg
+unzipimg
+attachImg
+expandImg
+mntImg
+prepChroot
+cpDistroFiles
+applyPatches
+confSwap
+runScripts
+insWebmin
+insCode
+insNode
+reSwapConf
+unmount
+chkShrnk
+xzFinalImg
