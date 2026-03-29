@@ -2,7 +2,7 @@
 # build.yml
 #
 
-name: Build ARM64 Release
+name: Build ARMHF Release
 
 on:
   workflow_dispatch:
@@ -15,22 +15,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up ARM64 emulation
+      - name: Set up ARMHF emulation
         uses: docker/setup-qemu-action@v3
         with:
-          platforms: arm64
+          platforms: armhf
 
-      - name: Set up ARM64 build environment
+      - name: Set up ARMHF build environment
         uses: docker/setup-buildx-action@v3
         with:
           install: true
 
-      - name: Run commands inside ARM64 container
+      - name: Run commands inside ARMHF container
         uses: addnab/docker-run-action@v3
         with:
           image: ubuntu:22.04
           options: |
-            --platform=linux/arm64
+            --platform=linux/armhf
             -v ${{ github.workspace }}:/workspace
             -w /workspace
           run: |
@@ -61,7 +61,7 @@ jobs:
       - name: Upload ZIP artifact
         uses: actions/upload-artifact@v5
         with:
-          name: arm64-build-${{ github.ref_name }}
+          name: armhf-build-${{ github.ref_name }}
           path: ${{ steps.findfile.outputs.file }}
           compression-level: 9
           retention-days: 14
