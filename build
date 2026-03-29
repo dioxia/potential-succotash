@@ -52,9 +52,11 @@ success() {
 
 SCRIPTNAME=$(basename "$0")
 MOUNT="mnt"
-RPIZIP="raspios-bullseye-arm64.zip"
+# RPIZIP="raspios-bullseye-arm64.zip"
+RPIZIP="raspios-bullseye-armhf.zip"
 RPIIMG="${RPIZIP%.zip}.img"
-RPIURL="https://downloads.raspberrypi.org/raspios_lite_arm64/images/raspios_lite_arm64-2022-01-28/2022-01-28-raspios-bullseye-arm64-lite.zip"
+# RPIURL="https://downloads.raspberrypi.org/raspios_lite_arm64/images/raspios_lite_arm64-2022-01-28/2022-01-28-raspios-bullseye-arm64-lite.zip"
+RPIURL="https://downloads.raspberrypi.org/raspios_lite_armhf/images/raspios_lite_armhf-2022-01-28/2022-01-28-raspios-bullseye-armhf-lite.zip"
 
 # Allow empty sets
 shopt -s nullglob
@@ -260,8 +262,8 @@ applyPatches
 confSwap
 runScripts
 insWebmin
-insCode
-insNode
+# insCode
+# insNode
 reSwapConf
 unmount
 chkShrnk
