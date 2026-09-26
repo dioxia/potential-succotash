@@ -1,0 +1,193 @@
+name: Build Gitea Raspberry Pi Zero Image
+
+on:
+  workflow_dispatch: # Allows manual triggering of the workflow
+
+jobs:
+  build_image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies for Image Creation
+        run: |
+          sudo apt update -qq
+          sudo apt install -y qemu-user-static debootstrap xz-utils kpartx e2fsprogs parted coreutils
+
+      - name: Define Variables
+        id: vars
+        run: |
+          IMAGE_NAME="gitea-rpi-zero-bullseye"
+          IMAGE_SIZE_MB="2048" # 2GB image size, adjust as needed
+          BOOT_PART_SIZE_MB="256" # 256MB for boot partition
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "IMAGE_SIZE_MB=$IMAGE_SIZE_MB" >> $GITHUB_OUTPUT
+          echo "BOOT_PART_SIZE_MB=$BOOT_PART_SIZE_MB" >> $GITHUB_OUTPUT
+
+      - name: Create Disk Image File
+        run: |
+          fallocate -l ${{ steps.vars.outputs.IMAGE_SIZE_MB }}M ${{ steps.vars.outputs.IMAGE_NAME }}.img
+
+      - name: Create Partitions
+        run: |
+          sudo parted -s ${{ steps.vars.outputs.IMAGE_NAME }}.img mklabel msdos
+          sudo parted -s ${{ steps.vars.outputs.IMAGE_NAME }}.img mkpart primary fat32 0% ${{ steps.vars.outputs.BOOT_PART_SIZE_MB }}MB
+          sudo parted -s ${{ steps.vars.outputs.IMAGE_NAME }}.img mkpart primary ext4 ${{ steps.vars.outputs.BOOT_PART_SIZE_MB }}MB 100%
+
+      - name: Map Partitions
+        id: map_partitions
+        run: |
+          LOOP_DEVICE=$(sudo losetup --find --show ${{ steps.vars.outputs.IMAGE_NAME }}.img)
+          echo "LOOP_DEVICE=$LOOP_DEVICE" >> $GITHUB_OUTPUT
+          sudo partprobe $LOOP_DEVICE
+          # Give some time for partitions to show up
+          sleep 5
+          BOOT_PART=$(sudo kpartx -l $LOOP_DEVICE | awk '{print $1}' | head -n 1) # Assuming first partition is boot
+          ROOT_PART=$(sudo kpartx -l $LOOP_DEVICE | awk '{print $1}' | tail -n 1) # Assuming second partition is root
+          echo "BOOT_PART=/dev/mapper/$BOOT_PART" >> $GITHUB_OUTPUT
+          echo "ROOT_PART=/dev/mapper/$ROOT_PART" >> $GITHUB_OUTPUT
+          sudo kpartx -a $LOOP_DEVICE
+
+      - name: Format Partitions
+        run: |
+          sudo mkfs.vfat -F 32 ${{ steps.map_partitions.outputs.BOOT_PART }}
+          sudo mkfs.ext4 ${{ steps.map_partitions.outputs.ROOT_PART }}
+
+      - name: Mount Partitions
+        run: |
+          mkdir -p mount_root mount_boot
+          sudo mount ${{ steps.map_partitions.outputs.ROOT_PART }} mount_root
+          sudo mkdir -p mount_root/boot
+          sudo mount ${{ steps.map_partitions.outputs.BOOT_PART }} mount_root/boot
+
+      - name: Bootstrap Debian Bullseye
+        run: |
+          sudo debootstrap --arch=armhf --foreign bullseye mount_root http://deb.debian.org/debian/
+          sudo cp /usr/bin/qemu-arm-static mount_root/usr/bin/
+
+      - name: Configure Chroot Environment (Stage 2 debootstrap and system setup)
+        run: |
+          sudo chroot mount_root /debootstrap/debootstrap --second-stage
+
+      - name: Enter Chroot and Configure System
+        run: |
+          sudo chroot mount_root bash << EOF
+            # Mount necessary pseudo-filesystems
+            mount -t proc /proc proc/
+            mount -t sysfs /sys sys/
+            mount -o bind /dev dev/
+            mount -o bind /dev/pts dev/pts/
+
+            # Update and upgrade system
+            apt update -qq
+            apt dist-upgrade -y -f
+            apt install -y git curl wget neofetch make gcc g++ llvm python3-all python3-pip python3-venv
+
+            # Create gitea user and group
+            adduser --system --group --home /home/gitea gitea
+            mkdir -p /home/gitea/.gitea/custom
+            chown -R gitea:gitea /home/gitea/.gitea
+
+            # Download and install Gitea
+            GITEA_VERSION="1.21.11" # Check for the latest stable version
+            wget -O /usr/local/bin/gitea https://github.com/go-gitea/gitea/releases/download/v\${GITEA_VERSION}/gitea-\${GITEA_VERSION}-linux-arm-7
+            chmod +x /usr/local/bin/gitea
+            chown gitea:gitea /usr/local/bin/gitea
+
+            # Create Gitea directories
+            mkdir -p /etc/gitea
+            chown gitea:gitea /etc/gitea
+
+            # Create app.ini (minimal example, needs more configuration based on actual needs)
+            cat > /home/gitea/.gitea/app.ini << EOL
+            APP_NAME = Gitea (zero)
+            RUN_USER = gitea
+            RUN_MODE = prod
+            [database]
+            DB_TYPE = sqlite3
+            PATH = /etc/gitea/data/gitea.db
+            [repository]
+            ROOT = /etc/gitea/gitea-repositories
+            [server]
+            HTTP_PORT = 3000
+            DISABLE_SSH = false
+            SSH_DOMAIN = localhost
+            DOMAIN = localhost
+            ROOT_URL = http://localhost:3000/
+            [session]
+            PROVIDER = file
+            [log]
+            MODE = file
+            LEVEL = Info
+            ROOT_PATH = /etc/gitea/log
+            EOL
+            chown gitea:gitea /home/gitea/.gitea/app.ini
+            chmod 600 /home/gitea/.gitea/app.ini
+
+            # Create systemd service file
+            cat > /etc/systemd/system/gitea.service << EOL
+            [Unit]
+            Description=Gitea (zero)
+            After=network.target
+
+            [Service]
+            User=gitea
+            Group=gitea
+            Type=simple
+            WorkingDirectory=/etc/gitea
+            ExecStart=/usr/local/bin/gitea web --custom-path /home/gitea/.gitea/custom --config /home/gitea/.gitea/app.ini
+            RestartSec=2s
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            EOL
+
+            # Enable and start Gitea service
+            systemctl enable gitea.service
+
+            # Basic network configuration (replace with your specific needs for RPi Zero)
+            # You might need to adjust /etc/network/interfaces or use NetworkManager
+            cat > /etc/apt/sources.list << EOL
+            deb http://deb.debian.org/debian/ bullseye main contrib non-free
+            deb-src http://deb.debian.org/debian/ bullseye main contrib non-free
+
+            deb http://deb.debian.org/debian/ bullseye-updates main contrib non-free
+            deb-src http://deb.debian.org/debian/ bullseye-updates main contrib non-free
+
+            deb http://security.debian.org/debian-security/ bullseye-security main contrib non-free
+            deb-src http://security.debian.org/debian-security/ bullseye-security main contrib non-free
+            EOL
+
+            # Cleanup debootstrap files
+            apt clean
+            rm -rf /var/lib/apt/lists/*
+            rm -rf /debootstrap
+
+            # Unmount pseudo-filesystems before exiting chroot
+            umount /proc
+            umount /sys
+            umount /dev/pts
+            umount /dev
+
+            exit
+          EOF
+
+      - name: Unmount Partitions and Loop Device
+        run: |
+          sudo umount mount_root/boot || true
+          sudo umount mount_root || true
+          sudo kpartx -d ${{ steps.map_partitions.outputs.LOOP_DEVICE }}
+          sudo losetup -d ${{ steps.map_partitions.outputs.LOOP_DEVICE }} || true
+
+      - name: Compress Disk Image
+        run: |
+          xz -T0 -v ${{ steps.vars.outputs.IMAGE_NAME }}.img
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitea-rpi-zero-image
+          path: ${{ steps.vars.outputs.IMAGE_NAME }}.img.xz
